@@ -305,7 +305,7 @@ fun PresetsTab(vm: EditorViewModel) {
 
     Column(Modifier.padding(vertical = 12.dp)) {
         LazyRow(contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(BUILTIN_PRESETS + custom) { preset ->
+            items(BUILTIN_PRESETS + custom, key = { it.id }) { preset ->
                 Column(
                     Modifier.width(84.dp).combinedClickable(
                         onClick = { vm.applyPreset(preset) },
@@ -313,7 +313,7 @@ fun PresetsTab(vm: EditorViewModel) {
                     ),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    val t = thumbs[preset.name]
+                    val t = thumbs[preset.id]
                     Box(Modifier.size(84.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant)) {
                         if (t != null) Image(t.asImageBitmap(), null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
                     }
@@ -362,8 +362,13 @@ fun CropTab(vm: EditorViewModel, params: EditParams) {
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { vm.pushUndo(); vm.update { it.copy(rotation = (it.rotation + 3) % 4) } }) { Text("⟲ 90°") }
-            OutlinedButton(onClick = { vm.pushUndo(); vm.update { it.copy(rotation = (it.rotation + 1) % 4) } }) { Text("⟳ 90°") }
+            // Com um (e só um) espelhamento ativo o sentido da rotação se inverte na imagem final
+            fun rotate(dir: Int) = vm.update {
+                val step = if (it.flipH != it.flipV) -dir else dir
+                it.copy(rotation = ((it.rotation + step) % 4 + 4) % 4)
+            }
+            OutlinedButton(onClick = { vm.pushUndo(); rotate(-1) }) { Text("⟲ 90°") }
+            OutlinedButton(onClick = { vm.pushUndo(); rotate(1) }) { Text("⟳ 90°") }
             OutlinedButton(onClick = { vm.pushUndo(); vm.update { it.copy(flipH = !it.flipH) } }) { Text("↔") }
             OutlinedButton(onClick = { vm.pushUndo(); vm.update { it.copy(flipV = !it.flipV) } }) { Text("↕") }
         }

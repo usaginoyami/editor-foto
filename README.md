@@ -14,9 +14,15 @@ Editor de fotos para Android, **inspirado no Adobe Lightroom**. Sem login, sem a
 - **Cortar:** proporções prontas, girar 90°, espelhar e endireitar
 - **Comparar:** segure a foto para ver o original
 - **Desfazer** e **Resetar**
-- **Salvar** em JPEG (qualidade 95) em `Imagens/EditorFoto`
+- **Salvar** em JPEG (qualidade 95) em `Imagens/EditorFoto`, na **resolução original** da foto e mantendo data, câmera e exposição (EXIF)
+- **P&B de verdade:** saturação em -100 usa a luma, então as cores viram tons de cinza distintos
+- **Exposição e temperatura em luz linear**, para um resultado mais natural
 
 Tudo funciona offline e as fotos nunca saem do seu aparelho.
+
+## Baixar
+
+Os APKs ficam na aba [Releases](https://github.com/usaginoyami/editor-foto/releases). Para instalar, permita "instalar apps de fontes desconhecidas" no Android.
 
 ## O que ele não tem
 
@@ -34,10 +40,26 @@ O APK de teste fica em `app/build/outputs/apk/debug/app-debug.apk`.
 
 **Requisitos:** Android 10 ou mais novo (minSdk 29).
 
+## Publicar uma release (para quem mantém o projeto)
+
+1. Gere uma chave uma única vez: `keytool -genkey -v -keystore release.jks -alias editorfoto -keyalg RSA -keysize 2048 -validity 10000`
+2. Para assinar localmente, crie `keystore.properties` na raiz (já está no `.gitignore`):
+   ```
+   storeFile=release.jks
+   storePassword=...
+   keyAlias=editorfoto
+   keyPassword=...
+   ```
+   e rode `gradle assembleRelease` (ou use **Build > Generate Signed Bundle / APK** no Android Studio).
+3. Para o GitHub Actions assinar sozinho, cadastre em **Settings > Secrets and variables > Actions** os secrets `KEYSTORE_BASE64` (`base64 -w0 release.jks`), `KEYSTORE_PASSWORD`, `KEY_ALIAS` e `KEY_PASSWORD`.
+4. Crie a tag e envie: `git tag v1.0 && git push origin v1.0`. O workflow gera o APK e abre a release. Sem os secrets, ele publica um APK de debug.
+
+Guarde o `release.jks` em local seguro: sem ele não dá para atualizar o app para quem já instalou.
+
 ## Tecnologias
 
 Kotlin, Jetpack Compose, Material 3 e processamento de imagem próprio (sem bibliotecas externas de edição).
 
 ## Licença
 
-Defina uma licença no repositório (por exemplo, MIT) para deixar claro como o código pode ser usado.
+[MIT](LICENSE). Você pode usar, modificar e distribuir, mantendo o aviso de copyright.

@@ -21,10 +21,11 @@ object ImageProcessor {
         var bmp = src
         val turns = ((p.rotation % 4) + 4) % 4
         if (turns != 0 || p.flipH || p.flipV) {
+            // Gira primeiro e espelha depois: assim ↔ e ↕ sempre espelham o que se vê na tela.
             val m = Matrix()
+            if (turns != 0) m.postRotate(90f * turns)
             if (p.flipH) m.postScale(-1f, 1f)
             if (p.flipV) m.postScale(1f, -1f)
-            if (turns != 0) m.postRotate(90f * turns)
             bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
         }
         if (abs(p.straighten) > 0.05f) {
@@ -96,6 +97,17 @@ object ImageProcessor {
 
     private val HUE_CENTERS = floatArrayOf(0f, 30f, 60f, 120f, 180f, 240f, 270f, 320f, 360f)
 
+    // Tabelas sRGB <-> luz linear (exposição e balanço de branco ficam fisicamente corretos)
+    private const val LIN_STEPS = 4096
+    private val SRGB_TO_LIN = FloatArray(256) { i ->
+        val c = i / 255f
+        if (c <= 0.04045f) c / 12.92f else ((c + 0.055f) / 1.055f).pow(2.4f)
+    }
+    private val LIN_TO_SRGB = FloatArray(LIN_STEPS + 1) { i ->
+        val l = i / LIN_STEPS.toFloat()
+        if (l <= 0.0031308f) l * 12.92f else 1.055f * l.pow(1f / 2.4f) - 0.055f
+    }
+
     fun applyColor(src: Bitmap, p: EditParams): Bitmap {
         if (!p.hasColorEdits) return src
         val w = src.width
@@ -103,20 +115,24 @@ object ImageProcessor {
         val px = IntArray(w * h)
         src.getPixels(px, 0, w, 0, 0, w, h)
 
+        // Multiplicadores aplicados em luz linear. O expoente 2,2 mantém a força que
+        // temperatura/matiz tinham antes (quando eram aplicados direto no valor sRGB).
+        val useLin = p.exposure != 0f || p.temperature != 0f || p.tint != 0f
         val expMul = 2f.pow(p.exposure)
-        val rMul = expMul * (1f + p.temperature * 0.25f)
-        val bMul = expMul * (1f - p.temperature * 0.25f)
-        val gMul = expMul * (1f - p.tint * 0.15f)
+        val rMul = expMul * (1f + p.temperature * 0.25f).pow(2.2f)
+        val bMul = expMul * (1f - p.temperature * 0.25f).pow(2.2f)
+        val gMul = expMul * (1f - p.tint * 0.15f).pow(2.2f)
         val cf = 1f + p.contrast
         val sh = p.shadows * 0.35f
         val hi = p.highlights * 0.35f
         val lut = buildCurveLut(p.curve)
         val useCurve = p.curve != IDENTITY_CURVE
-        val useHsl = p.saturation != 0f || p.vibrance != 0f || p.hsl.any { !it.isZero }
+        val gSat = max(p.saturation, 0f)                              // aumento de saturação (HSL)
+        val desat = if (p.saturation < 0f) 1f + p.saturation else 1f  // redução: mistura com a luma
+        val useHsl = gSat != 0f || p.vibrance != 0f || p.hsl.any { !it.isZero }
         val hueAdj = FloatArray(8) { p.hsl[it].hue * 30f }
         val satAdj = FloatArray(8) { p.hsl[it].sat }
         val lumAdj = FloatArray(8) { p.hsl[it].lum * 0.25f }
-        val gSat = p.saturation
         val vib = p.vibrance
 
         IntStream.range(0, h).parallel().forEach { y ->
@@ -125,9 +141,21 @@ object ImageProcessor {
             while (i < end) {
                 val c = px[i]
                 val a = c ushr 24
-                var r = (((c shr 16) and 255) / 255f * rMul).coerceIn(0f, 1f)
-                var g = (((c shr 8) and 255) / 255f * gMul).coerceIn(0f, 1f)
-                var b = ((c and 255) / 255f * bMul).coerceIn(0f, 1f)
+                val r8 = (c shr 16) and 255
+                val g8 = (c shr 8) and 255
+                val b8 = c and 255
+                var r: Float
+                var g: Float
+                var b: Float
+                if (useLin) {
+                    r = LIN_TO_SRGB[((SRGB_TO_LIN[r8] * rMul).coerceIn(0f, 1f) * LIN_STEPS + 0.5f).toInt()]
+                    g = LIN_TO_SRGB[((SRGB_TO_LIN[g8] * gMul).coerceIn(0f, 1f) * LIN_STEPS + 0.5f).toInt()]
+                    b = LIN_TO_SRGB[((SRGB_TO_LIN[b8] * bMul).coerceIn(0f, 1f) * LIN_STEPS + 0.5f).toInt()]
+                } else {
+                    r = r8 / 255f
+                    g = g8 / 255f
+                    b = b8 / 255f
+                }
 
                 // contraste
                 r = ((r - 0.5f) * cf + 0.5f).coerceIn(0f, 1f)
@@ -150,7 +178,16 @@ object ImageProcessor {
                     b = lut[(b * 255f + 0.5f).toInt()]
                 }
 
-                // saturação / vibração / HSL
+                // reduzir saturação: mistura com a luma (Rec. 709), não com a luminosidade HSL;
+                // assim -100 vira um P&B com contraste correto entre as cores
+                if (desat < 1f) {
+                    val y = 0.2126f * r + 0.7152f * g + 0.0722f * b
+                    r = y + (r - y) * desat
+                    g = y + (g - y) * desat
+                    b = y + (b - y) * desat
+                }
+
+                // aumento de saturação / vibração / HSL
                 if (useHsl) {
                     val mx = max(r, max(g, b))
                     val mn = minOf(r, minOf(g, b))
@@ -175,7 +212,7 @@ object ImageProcessor {
                         val dlum = lumAdj[idx] * (1f - t) + lumAdj[j] * t
 
                         hh = (hh + dh + 360f) % 360f
-                        s = s * (1f + gSat) * (1f + ds)
+                        s = s * (1f + gSat) * (1f + ds)  // gSat >= 0 aqui
                         s += vib * (1f - s.coerceIn(0f, 1f)) * s
                         s = s.coerceIn(0f, 1f)
                         val l2 = (l + dlum * s).coerceIn(0f, 1f)
