@@ -10,6 +10,7 @@ import android.provider.MediaStore
 import androidx.exifinterface.media.ExifInterface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,7 +47,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     private val renderTrigger = MutableStateFlow(0)
 
-    private var fullSource: Bitmap? = null   // para exportar
+    private var sourceUri: Uri? = null       // a exportação relê o original em resolução total
     private var previewSource: Bitmap? = null
     private var thumbSource: Bitmap? = null
 
@@ -86,11 +87,11 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _loading.value = true
             try {
-                val (full, prev, thumb) = withContext(Dispatchers.IO) {
-                    val f = decode(uri, 4000)
-                    Triple(f, scaleTo(f, 1280), scaleTo(f, 160))
+                val (prev, thumb) = withContext(Dispatchers.IO) {
+                    val p = decode(uri, 1280)
+                    p to scaleTo(p, 160)
                 }
-                fullSource = full
+                sourceUri = uri
                 previewSource = prev
                 thumbSource = thumb
                 _opened.value = true
@@ -100,7 +101,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                 _rendered.value = null
                 renderTrigger.value++
                 buildThumbs()
-            } catch (e: Exception) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {   // inclui OutOfMemoryError
                 _message.value = "Não consegui abrir essa foto."
             } finally {
                 _loading.value = false
@@ -110,7 +113,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     fun close() {
         _opened.value = false
-        fullSource = null; previewSource = null; thumbSource = null
+        sourceUri = null; previewSource = null; thumbSource = null
         geoBitmap = null; geoKey = null
         _rendered.value = null
         _thumbs.value = emptyMap()
@@ -217,7 +220,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.Default) {
             val map = HashMap<String, Bitmap>()
             (BUILTIN_PRESETS + _customPresets.value).forEach {
-                map[it.name] = ImageProcessor.applyColor(t, it.look)
+                map[it.id] = ImageProcessor.applyColor(t, it.look)
             }
             _thumbs.value = map
         }
@@ -226,31 +229,88 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     // ---------- exportar ----------
 
     fun export() {
-        val src = fullSource ?: return
+        val src = sourceUri ?: return
         val p = _params.value
         viewModelScope.launch {
             _loading.value = true
             val ok = withContext(Dispatchers.IO) {
                 try {
-                    val out = ImageProcessor.render(src, p)
-                    val resolver = getApplication<Application>().contentResolver
-                    val values = ContentValues().apply {
-                        put(MediaStore.Images.Media.DISPLAY_NAME, "EditorFoto_${System.currentTimeMillis()}.jpg")
-                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/EditorFoto")
-                        put(MediaStore.Images.Media.IS_PENDING, 1)
-                    }
-                    val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)!!
-                    resolver.openOutputStream(uri)!!.use { out.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-                    values.clear()
-                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                    resolver.update(uri, values, null, null)
+                    saveJpeg(renderFullRes(src, p), src)
                     true
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Throwable) { false }
             }
             _loading.value = false
             _message.value = if (ok) "Salva em Imagens/EditorFoto" else "Falha ao salvar a foto."
         }
+    }
+
+    /** Relê o original sem reduzir; se faltar memória, tenta de novo com lados máximos menores. */
+    private fun renderFullRes(uri: Uri, p: EditParams): Bitmap {
+        var failure: OutOfMemoryError? = null
+        for (side in intArrayOf(Int.MAX_VALUE, 8000, 6000, 4000)) {
+            try {
+                return ImageProcessor.render(decode(uri, side), p)
+            } catch (e: OutOfMemoryError) {
+                failure = e
+            }
+        }
+        throw failure ?: IllegalStateException("render falhou")
+    }
+
+    private fun saveJpeg(bmp: Bitmap, source: Uri) {
+        val resolver = getApplication<Application>().contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "EditorFoto_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/EditorFoto")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)!!
+        try {
+            resolver.openOutputStream(uri)!!.use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+            copyExif(source, uri)
+            values.clear()
+            values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+        } catch (e: Throwable) {
+            resolver.delete(uri, null, null)   // não deixa arquivo pela metade na galeria
+            throw e
+        }
+    }
+
+    /** Copia data, câmera e exposição do original (a localização só vem se o sistema a fornecer). */
+    private fun copyExif(from: Uri, to: Uri) {
+        val cr = getApplication<Application>().contentResolver
+        try {
+            val src = cr.openInputStream(from)?.use { ExifInterface(it) } ?: return
+            cr.openFileDescriptor(to, "rw")?.use { pfd ->
+                val dst = ExifInterface(pfd.fileDescriptor)
+                for (tag in EXIF_TAGS) src.getAttribute(tag)?.let { dst.setAttribute(tag, it) }
+                // a rotação do EXIF já foi aplicada nos pixels
+                dst.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
+                dst.setAttribute(ExifInterface.TAG_SOFTWARE, "Editor Foto")
+                dst.saveAttributes()
+            }
+        } catch (_: Exception) {
+            // sem EXIF a foto continua válida; não vale falhar a exportação por isso
+        }
+    }
+
+    private companion object {
+        val EXIF_TAGS = listOf(
+            ExifInterface.TAG_DATETIME, ExifInterface.TAG_DATETIME_ORIGINAL, ExifInterface.TAG_DATETIME_DIGITIZED,
+            ExifInterface.TAG_SUBSEC_TIME, ExifInterface.TAG_SUBSEC_TIME_ORIGINAL, ExifInterface.TAG_SUBSEC_TIME_DIGITIZED,
+            "OffsetTime", "OffsetTimeOriginal", "OffsetTimeDigitized",
+            ExifInterface.TAG_MAKE, ExifInterface.TAG_MODEL, "LensModel",
+            ExifInterface.TAG_F_NUMBER, ExifInterface.TAG_EXPOSURE_TIME, ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY,
+            ExifInterface.TAG_FOCAL_LENGTH, ExifInterface.TAG_FLASH, ExifInterface.TAG_WHITE_BALANCE,
+            ExifInterface.TAG_GPS_LATITUDE, ExifInterface.TAG_GPS_LATITUDE_REF,
+            ExifInterface.TAG_GPS_LONGITUDE, ExifInterface.TAG_GPS_LONGITUDE_REF,
+            ExifInterface.TAG_GPS_ALTITUDE, ExifInterface.TAG_GPS_ALTITUDE_REF,
+            ExifInterface.TAG_GPS_TIMESTAMP, ExifInterface.TAG_GPS_DATESTAMP
+        )
     }
 
     fun clearMessage() { _message.value = null }

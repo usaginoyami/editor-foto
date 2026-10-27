@@ -90,7 +90,10 @@ data class EditParams(
     }
 }
 
-data class Preset(val name: String, val look: EditParams, val custom: Boolean = false)
+data class Preset(val name: String, val look: EditParams, val custom: Boolean = false) {
+    /** Chave única: um preset seu pode ter o mesmo nome de um nativo sem colidir. */
+    val id: String get() = (if (custom) "c:" else "b:") + name
+}
 
 val BUILTIN_PRESETS = listOf(
     Preset("Original", EditParams()),
