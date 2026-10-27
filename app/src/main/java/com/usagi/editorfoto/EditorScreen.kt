@@ -2,6 +2,11 @@
 
 package com.usagi.editorfoto
 
+import android.content.ClipData
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.border
@@ -68,10 +73,23 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalDensity
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-private val TABS = listOf("Luz", "Cor", "HSL", "Curva", "Presets", "Cortar")
+private val TABS = listOf("Luz", "Cor", "HSL", "Curva", "Efeitos", "Presets", "Cortar")
+private const val TAB_CROP = 6
 
 @Composable
 fun EditorScreen(vm: EditorViewModel) {
@@ -81,13 +99,22 @@ fun EditorScreen(vm: EditorViewModel) {
     val loading by vm.loading.collectAsState()
     val canUndo by vm.canUndo.collectAsState()
     val message by vm.message.collectAsState()
+    val saved by vm.saved.collectAsState()
     var tab by remember { mutableIntStateOf(0) }
     var showOriginal by remember { mutableStateOf(false) }
+    var showHist by remember { mutableStateOf(false) }
+    var zoom by remember { mutableFloatStateOf(1f) }
+    var pan by remember { mutableStateOf(Offset.Zero) }
 
     BackHandler { vm.close() }
     LaunchedEffect(message) {
         message?.let { Toast.makeText(ctx, it, Toast.LENGTH_SHORT).show(); vm.clearMessage() }
     }
+
+    val r = rendered
+    val sv = saved
+    val canShare = sv != null && sv.params == params
+    val imgAspect = r?.let { it.geo.width / it.geo.height.toFloat() } ?: 1f
 
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).statusBarsPadding().navigationBarsPadding()) {
         // barra superior
@@ -105,33 +132,70 @@ fun EditorScreen(vm: EditorViewModel) {
         }
 
         // pré-visualização
-        Box(
-            Modifier.weight(1f).fillMaxWidth().padding(8.dp)
-                .pointerInput(Unit) {
-                    detectTapGestures(onPress = {
-                        showOriginal = true
-                        tryAwaitRelease()
-                        showOriginal = false
-                    })
-                },
-            contentAlignment = Alignment.Center
-        ) {
-            rendered?.let {
-                Image(
-                    bitmap = (if (showOriginal) it.original else it.edited).asImageBitmap(),
-                    contentDescription = null,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize()
-                )
+        Box(Modifier.weight(1f).fillMaxWidth().padding(8.dp), contentAlignment = Alignment.Center) {
+            if (tab == TAB_CROP && r != null) {
+                CropPreview(vm, params, r.geo)
+            } else {
+                Box(
+                    Modifier.fillMaxSize().clipToBounds()
+                        // pinça = zoom, arrastar = mover (a prévia tem até 1280 px)
+                        .pointerInput(Unit) {
+                            detectTransformGestures { centroid, panDelta, zoomDelta, _ ->
+                                val s0 = zoom
+                                val s1 = (s0 * zoomDelta).coerceIn(1f, 6f)
+                                val center = Offset(size.width / 2f, size.height / 2f)
+                                val rel = centroid - center
+                                val o = rel + panDelta - (rel - pan) * (s1 / s0)
+                                val mx = (s1 - 1f) * size.width / 2f
+                                val my = (s1 - 1f) * size.height / 2f
+                                zoom = s1
+                                pan = if (s1 <= 1f) Offset.Zero else Offset(o.x.coerceIn(-mx, mx), o.y.coerceIn(-my, my))
+                            }
+                        }
+                        // segurar (sem mexer) = ver o original; toque duplo = voltar ao zoom 1x
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onDoubleTap = { zoom = 1f; pan = Offset.Zero },
+                                onPress = {
+                                    coroutineScope {
+                                        val job = launch { delay(250); showOriginal = true }
+                                        tryAwaitRelease()
+                                        job.cancel()
+                                    }
+                                    showOriginal = false
+                                }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    r?.let {
+                        Image(
+                            bitmap = (if (showOriginal) it.original else it.edited).asImageBitmap(),
+                            contentDescription = null,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier.fillMaxSize().graphicsLayer {
+                                scaleX = zoom; scaleY = zoom
+                                translationX = pan.x; translationY = pan.y
+                            }
+                        )
+                    }
+                    if (showOriginal) {
+                        Text(
+                            "ORIGINAL",
+                            modifier = Modifier.align(Alignment.TopCenter).background(Color(0x99000000), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 2.dp),
+                            fontSize = 12.sp, color = Color.White
+                        )
+                    }
+                }
+                if (showHist) r?.let {
+                    HistogramView(it.hist, Modifier.align(Alignment.TopStart).padding(6.dp).size(132.dp, 56.dp))
+                }
+                Row(Modifier.align(Alignment.TopEnd).padding(6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (canShare && sv != null) PreviewChip("COMPARTILHAR", false) { shareImage(ctx, sv.uri) }
+                    PreviewChip("HIST", showHist) { showHist = !showHist }
+                }
             }
             if (loading) CircularProgressIndicator()
-            if (showOriginal) {
-                Text(
-                    "ORIGINAL",
-                    modifier = Modifier.align(Alignment.TopCenter).background(Color(0x99000000), RoundedCornerShape(6.dp)).padding(horizontal = 8.dp, vertical = 2.dp),
-                    fontSize = 12.sp, color = Color.White
-                )
-            }
         }
 
         // abas
@@ -163,9 +227,63 @@ fun EditorScreen(vm: EditorViewModel) {
                 }
                 2 -> HslTab(vm, params)
                 3 -> CurveTab(vm, params)
-                4 -> PresetsTab(vm)
-                5 -> CropTab(vm, params)
+                4 -> Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp)) {
+                    AdjustSlider("Nitidez", params.sharpen, 0f..1f, vm, { "%d".format((it * 100).roundToInt()) }) { v, p -> p.copy(sharpen = v) }
+                    AdjustSlider("Vinheta", params.vignette, -1f..1f, vm) { v, p -> p.copy(vignette = v) }
+                    AdjustSlider("Granulação", params.grain, 0f..1f, vm, { "%d".format((it * 100).roundToInt()) }) { v, p -> p.copy(grain = v) }
+                }
+                5 -> PresetsTab(vm)
+                6 -> CropTab(vm, params, imgAspect)
             }
+        }
+    }
+}
+
+private fun shareImage(ctx: Context, uri: Uri) {
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "image/jpeg"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        clipData = ClipData.newRawUri(null, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    ctx.startActivity(Intent.createChooser(send, "Compartilhar foto"))
+}
+
+@Composable
+private fun PreviewChip(label: String, active: Boolean, onClick: () -> Unit) {
+    Text(
+        label,
+        fontSize = 11.sp,
+        color = Color.White,
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (active) MaterialTheme.colorScheme.primary else Color(0x99000000))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+    )
+}
+
+@Composable
+private fun HistogramView(h: ImageProcessor.Histogram, modifier: Modifier) {
+    Canvas(modifier.background(Color(0x99000000), RoundedCornerShape(6.dp))) {
+        val w = size.width
+        val hh = size.height
+        var mx = 1
+        for (i in 1..254) mx = maxOf(mx, h.l[i], h.r[i], h.g[i], h.b[i])   // ignora as pontas (corte)
+        fun y(v: Int) = hh - hh * 0.95f * (v.coerceAtMost(mx).toFloat() / mx)
+        val fill = Path().apply {
+            moveTo(0f, hh)
+            for (i in 0..255) lineTo(w * i / 255f, y(h.l[i]))
+            lineTo(w, hh)
+            close()
+        }
+        drawPath(fill, Color(0x55FFFFFF))
+        for ((arr, c) in listOf(h.r to Color(0xCCFF5252), h.g to Color(0xCC69F0AE), h.b to Color(0xCC448AFF))) {
+            val path = Path()
+            for (i in 0..255) {
+                if (i == 0) path.moveTo(0f, y(arr[0])) else path.lineTo(w * i / 255f, y(arr[i]))
+            }
+            drawPath(path, c, style = Stroke(width = 2f))
         }
     }
 }
@@ -350,28 +468,125 @@ fun PresetsTab(vm: EditorViewModel) {
 // ---------- corte ----------
 
 @Composable
-fun CropTab(vm: EditorViewModel, params: EditParams) {
+fun CropTab(vm: EditorViewModel, params: EditParams, imgAspect: Float) {
     Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Aspect.values().forEach { a ->
                 FilterChip(
                     selected = params.aspect == a,
-                    onClick = { vm.pushUndo(); vm.update { it.copy(aspect = a) } },
+                    onClick = { vm.setAspect(a, imgAspect) },
                     label = { Text(a.label, fontSize = 12.sp) }
                 )
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            // Com um (e só um) espelhamento ativo o sentido da rotação se inverte na imagem final
-            fun rotate(dir: Int) = vm.update {
-                val step = if (it.flipH != it.flipV) -dir else dir
-                it.copy(rotation = ((it.rotation + step) % 4 + 4) % 4)
-            }
-            OutlinedButton(onClick = { vm.pushUndo(); rotate(-1) }) { Text("⟲ 90°") }
-            OutlinedButton(onClick = { vm.pushUndo(); rotate(1) }) { Text("⟳ 90°") }
-            OutlinedButton(onClick = { vm.pushUndo(); vm.update { it.copy(flipH = !it.flipH) } }) { Text("↔") }
-            OutlinedButton(onClick = { vm.pushUndo(); vm.update { it.copy(flipV = !it.flipV) } }) { Text("↕") }
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = { vm.rotate(-1) }) { Text("⟲ 90°") }
+            OutlinedButton(onClick = { vm.rotate(1) }) { Text("⟳ 90°") }
+            OutlinedButton(onClick = { vm.flip(true) }) { Text("↔") }
+            OutlinedButton(onClick = { vm.flip(false) }) { Text("↕") }
+            if (params.aspect.ratio != null) OutlinedButton(onClick = { vm.swapAspect(imgAspect) }) { Text("Inverter") }
+            if (!params.crop.isFull) OutlinedButton(onClick = { vm.resetCrop() }) { Text("Resetar corte") }
         }
         AdjustSlider("Endireitar", params.straighten, -45f..45f, vm, { "%+.1f°".format(it) }) { v, p -> p.copy(straighten = v) }
+        Text("Arraste os cantos e as bordas da foto para cortar.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/** Retângulo (em px da tela) onde uma imagem iw x ih aparece dentro de uma área cw x ch com ContentScale.Fit. */
+private class FitBox(val ox: Float, val oy: Float, val w: Float, val h: Float)
+
+private fun fitBox(cw: Float, ch: Float, iw: Float, ih: Float): FitBox {
+    val s = minOf(cw / iw, ch / ih)
+    val w = iw * s
+    val h = ih * s
+    return FitBox((cw - w) / 2f, (ch - h) / 2f, w, h)
+}
+
+private fun pickHandle(p: Offset, l: Float, t: Float, r: Float, b: Float, slop: Float, cornersOnly: Boolean): CropHandle? {
+    fun near(x: Float, y: Float) = abs(p.x - x) <= slop && abs(p.y - y) <= slop
+    if (near(l, t)) return CropHandle.TL
+    if (near(r, t)) return CropHandle.TR
+    if (near(l, b)) return CropHandle.BL
+    if (near(r, b)) return CropHandle.BR
+    val inX = p.x in l..r
+    val inY = p.y in t..b
+    if (!cornersOnly) {
+        if (inX && abs(p.y - t) <= slop) return CropHandle.T
+        if (inX && abs(p.y - b) <= slop) return CropHandle.B
+        if (inY && abs(p.x - l) <= slop) return CropHandle.L
+        if (inY && abs(p.x - r) <= slop) return CropHandle.R
+    }
+    return if (inX && inY) CropHandle.MOVE else null
+}
+
+/** Foto inteira (já girada/endireitada) com a área de corte por cima. */
+@Composable
+fun CropPreview(vm: EditorViewModel, params: EditParams, geo: Bitmap) {
+    val img = remember(geo) { geo.asImageBitmap() }
+    val ar = geo.width / geo.height.toFloat()
+    val cropNow by rememberUpdatedState(params.crop)
+    val ratioNow by rememberUpdatedState(params.aspect.lockFor(ar, params.aspectSwap))
+    val arNow by rememberUpdatedState(ar)
+    val slopPx = with(LocalDensity.current) { 36.dp.toPx() }
+
+    Box(
+        Modifier.fillMaxSize().pointerInput(geo) {
+            var active: CropHandle? = null
+            detectDragGestures(
+                onDragStart = { pos ->
+                    val g = fitBox(size.width.toFloat(), size.height.toFloat(), geo.width.toFloat(), geo.height.toFloat())
+                    val c = cropNow
+                    active = pickHandle(
+                        pos,
+                        g.ox + c.l * g.w, g.oy + c.t * g.h, g.ox + c.r * g.w, g.oy + c.b * g.h,
+                        slopPx, ratioNow != null
+                    )
+                    if (active != null) vm.pushUndo()
+                },
+                onDragEnd = { active = null },
+                onDragCancel = { active = null },
+                onDrag = { change, drag ->
+                    val h = active
+                    if (h != null) {
+                        change.consume()
+                        val g = fitBox(size.width.toFloat(), size.height.toFloat(), geo.width.toFloat(), geo.height.toFloat())
+                        val dx = drag.x / g.w
+                        val dy = drag.y / g.h
+                        vm.update { p -> p.copy(crop = CropMath.drag(p.crop, h, dx, dy, arNow, ratioNow)) }
+                    }
+                }
+            )
+        }
+    ) {
+        Image(img, null, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
+        Canvas(Modifier.fillMaxSize()) {
+            val g = fitBox(size.width, size.height, geo.width.toFloat(), geo.height.toFloat())
+            val c = params.crop
+            val l = g.ox + c.l * g.w
+            val t = g.oy + c.t * g.h
+            val r = g.ox + c.r * g.w
+            val b = g.oy + c.b * g.h
+            val dim = Color(0x99000000)
+            // escurece o que vai ser cortado fora
+            drawRect(dim, Offset(g.ox, g.oy), Size(g.w, (t - g.oy).coerceAtLeast(0f)))
+            drawRect(dim, Offset(g.ox, b), Size(g.w, (g.oy + g.h - b).coerceAtLeast(0f)))
+            drawRect(dim, Offset(g.ox, t), Size((l - g.ox).coerceAtLeast(0f), b - t))
+            drawRect(dim, Offset(r, t), Size((g.ox + g.w - r).coerceAtLeast(0f), b - t))
+            // grade de terços
+            val grid = Color(0x66FFFFFF)
+            for (k in 1..2) {
+                drawLine(grid, Offset(l + (r - l) * k / 3f, t), Offset(l + (r - l) * k / 3f, b), 1f)
+                drawLine(grid, Offset(l, t + (b - t) * k / 3f), Offset(r, t + (b - t) * k / 3f), 1f)
+            }
+            drawRect(Color.White, Offset(l, t), Size(r - l, b - t), style = Stroke(width = 2f))
+            // cantos
+            val len = 26.dp.toPx()
+            val th = 5f
+            fun corner(x: Float, y: Float, sx: Float, sy: Float) {
+                drawLine(Color.White, Offset(x - sx * th / 2f, y), Offset(x + sx * len, y), th)
+                drawLine(Color.White, Offset(x, y - sy * th / 2f), Offset(x, y + sy * len), th)
+            }
+            corner(l, t, 1f, 1f); corner(r, t, -1f, 1f); corner(l, b, 1f, -1f); corner(r, b, -1f, -1f)
+        }
     }
 }

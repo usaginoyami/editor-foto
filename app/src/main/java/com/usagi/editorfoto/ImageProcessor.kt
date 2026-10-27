@@ -43,20 +43,98 @@ object ImageProcessor {
             c.drawBitmap(bmp, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG))
             bmp = out
         }
-        p.aspect.ratio?.let { r ->
-            var t = r
-            if (t != 1f && ((bmp.width < bmp.height) != (t < 1f))) t = 1f / t
-            val cur = bmp.width / bmp.height.toFloat()
-            var nw = bmp.width
-            var nh = bmp.height
-            if (cur > t) nw = (bmp.height * t).roundToInt() else nh = (bmp.width / t).roundToInt()
-            nw = nw.coerceIn(1, bmp.width)
-            nh = nh.coerceIn(1, bmp.height)
-            if (nw != bmp.width || nh != bmp.height) {
-                bmp = Bitmap.createBitmap(bmp, (bmp.width - nw) / 2, (bmp.height - nh) / 2, nw, nh)
+        return bmp
+    }
+
+    /** Corte manual: [c] em coordenadas normalizadas da imagem já girada/endireitada. */
+    fun applyCrop(src: Bitmap, c: CropRect): Bitmap {
+        if (c.isFull) return src
+        val w = src.width
+        val h = src.height
+        val x = (c.l * w).roundToInt().coerceIn(0, w - 1)
+        val y = (c.t * h).roundToInt().coerceIn(0, h - 1)
+        val cw = ((c.r * w).roundToInt() - x).coerceIn(1, w - x)
+        val ch = ((c.b * h).roundToInt() - y).coerceIn(1, h - y)
+        if (x == 0 && y == 0 && cw == w && ch == h) return src
+        return Bitmap.createBitmap(src, x, y, cw, ch)
+    }
+
+    // ---------- Nitidez (máscara de nitidez) ----------
+
+    /**
+     * Realça detalhes somando a diferença entre a foto e uma versão borrada.
+     * O raio cresce com a resolução, então a prévia e a foto exportada ficam parecidas.
+     */
+    fun applySharpen(src: Bitmap, amount: Float): Bitmap {
+        if (amount <= 0f) return src
+        val w = src.width
+        val h = src.height
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        val out = IntArray(w * h)
+        val k = max(1, (max(w, h) / 1280f).roundToInt())
+        val amt = amount * 1.6f
+
+        IntStream.range(0, h).parallel().forEach { y ->
+            val r0 = (y - k).coerceAtLeast(0) * w
+            val r1 = y * w
+            val r2 = (y + k).coerceAtMost(h - 1) * w
+            val t = IntArray(9)
+            for (x in 0 until w) {
+                val x0 = (x - k).coerceAtLeast(0)
+                val x2 = (x + k).coerceAtMost(w - 1)
+                t[0] = px[r0 + x0]; t[1] = px[r0 + x]; t[2] = px[r0 + x2]
+                t[3] = px[r1 + x0]; t[4] = px[r1 + x]; t[5] = px[r1 + x2]
+                t[6] = px[r2 + x0]; t[7] = px[r2 + x]; t[8] = px[r2 + x2]
+                val a = t[4] ushr 24
+                out[r1 + x] = (a shl 24) or (sharpCh(t, 16, amt) shl 16) or
+                        (sharpCh(t, 8, amt) shl 8) or sharpCh(t, 0, amt)
             }
         }
+        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        bmp.setPixels(out, 0, w, 0, 0, w, h)
         return bmp
+    }
+
+    private fun sharpCh(t: IntArray, sh: Int, amt: Float): Int {
+        val blur = (((t[0] shr sh) and 255) + 2 * ((t[1] shr sh) and 255) + ((t[2] shr sh) and 255) +
+                2 * ((t[3] shr sh) and 255) + 4 * ((t[4] shr sh) and 255) + 2 * ((t[5] shr sh) and 255) +
+                ((t[6] shr sh) and 255) + 2 * ((t[7] shr sh) and 255) + ((t[8] shr sh) and 255)) / 16f
+        val c = (t[4] shr sh) and 255
+        return (c + (c - blur) * amt).roundToInt().coerceIn(0, 255)
+    }
+
+    // ---------- Histograma ----------
+
+    class Histogram(val r: IntArray, val g: IntArray, val b: IntArray, val l: IntArray)
+
+    /** Histograma por amostragem (barato o bastante para recalcular a cada ajuste). */
+    fun histogram(bmp: Bitmap): Histogram {
+        val w = bmp.width
+        val h = bmp.height
+        val hr = IntArray(256)
+        val hg = IntArray(256)
+        val hb = IntArray(256)
+        val hl = IntArray(256)
+        val stepX = max(1, w / 256)
+        val stepY = max(1, h / 160)
+        val row = IntArray(w)
+        var y = 0
+        while (y < h) {
+            bmp.getPixels(row, 0, w, 0, y, w, 1)
+            var x = 0
+            while (x < w) {
+                val c = row[x]
+                val r = (c shr 16) and 255
+                val g = (c shr 8) and 255
+                val b = c and 255
+                hr[r]++; hg[g]++; hb[b]++
+                hl[(0.2126f * r + 0.7152f * g + 0.0722f * b).roundToInt().coerceIn(0, 255)]++
+                x += stepX
+            }
+            y += stepY
+        }
+        return Histogram(hr, hg, hb, hl)
     }
 
     // ---------- Curva (spline monotônica) ----------
@@ -135,9 +213,23 @@ object ImageProcessor {
         val lumAdj = FloatArray(8) { p.hsl[it].lum * 0.25f }
         val vib = p.vibrance
 
+        // vinheta (elíptica, acompanha a proporção da foto) e granulação
+        val vig = p.vignette
+        val useVig = vig != 0f
+        val cx = (w - 1) / 2f
+        val cy = (h - 1) / 2f
+        val invCx = 1f / max(cx, 1f)
+        val invCy = 1f / max(cy, 1f)
+        val grainAmt = p.grain * 0.36f
+        val useGrain = p.grain > 0f
+        val cell = max(1, (max(w, h) / 1280f).roundToInt())   // grão com o mesmo tamanho aparente na prévia e na exportação
+
         IntStream.range(0, h).parallel().forEach { y ->
-            var i = y * w
+            val row = y * w
+            var i = row
             val end = i + w
+            val dy = (y - cy) * invCy
+            val dy2 = dy * dy
             while (i < end) {
                 val c = px[i]
                 val a = c ushr 24
@@ -233,6 +325,23 @@ object ImageProcessor {
                     }
                 }
 
+                if (useVig) {
+                    val dx = (i - row - cx) * invCx
+                    val d = sqrt((dx * dx + dy2) * 0.5f)
+                    val tt = ((d - 0.35f) / 0.65f).coerceIn(0f, 1f)
+                    val mul = 1f + vig * 0.9f * (tt * tt * (3f - 2f * tt))
+                    r *= mul; g *= mul; b *= mul
+                }
+                if (useGrain) {
+                    val gx = (i - row) / cell
+                    val gy = y / cell
+                    val n = (hash01(gx, gy) + hash01(gy + 977, gx + 131)) - 1f   // -1..1, mais denso no meio
+                    val l = 0.2126f * r + 0.7152f * g + 0.0722f * b
+                    val wgt = 1f - 0.6f * (2f * l - 1f) * (2f * l - 1f)          // menos grão em preto/branco puros
+                    val add = n * grainAmt * 0.5f * wgt
+                    r += add; g += add; b += add
+                }
+
                 val ri = (r.coerceIn(0f, 1f) * 255f + 0.5f).toInt()
                 val gi = (g.coerceIn(0f, 1f) * 255f + 0.5f).toInt()
                 val bi = (b.coerceIn(0f, 1f) * 255f + 0.5f).toInt()
@@ -245,5 +354,16 @@ object ImageProcessor {
         return out
     }
 
-    fun render(src: Bitmap, p: EditParams): Bitmap = applyColor(applyGeometry(src, p), p)
+    private fun hash01(x: Int, y: Int): Float {
+        var h = x * 374761393 + y * 668265263
+        h = (h xor (h ushr 13)) * 1274126177
+        h = h xor (h ushr 16)
+        return (h and 0xFFFF) / 65535f
+    }
+
+    /** Aplica nitidez (antes da cor) e depois os ajustes de cor, vinheta e grão. */
+    fun finish(cropped: Bitmap, p: EditParams): Bitmap = applyColor(applySharpen(cropped, p.sharpen), p)
+
+    fun render(src: Bitmap, p: EditParams): Bitmap =
+        finish(applyCrop(applyGeometry(src, p), p.crop), p)
 }
