@@ -23,7 +23,16 @@ import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.max
 
-class Rendered(val edited: Bitmap, val original: Bitmap)
+/** [edited] e [original] já estão cortados; [geo] é a foto girada/endireitada inteira (usada na tela de corte). */
+class Rendered(
+    val edited: Bitmap,
+    val original: Bitmap,
+    val geo: Bitmap,
+    val hist: ImageProcessor.Histogram
+)
+
+/** Última foto salva e os ajustes usados nela: o botão de compartilhar só vale enquanto nada mudou. */
+class Saved(val uri: Uri, val params: EditParams)
 
 class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -38,6 +47,9 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message.asStateFlow()
+
+    private val _saved = MutableStateFlow<Saved?>(null)
+    val saved: StateFlow<Saved?> = _saved.asStateFlow()
 
     private val _customPresets = MutableStateFlow<List<Preset>>(emptyList())
     val customPresets: StateFlow<List<Preset>> = _customPresets.asStateFlow()
@@ -70,11 +82,13 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             combine(_params, renderTrigger) { p, _ -> p }.collectLatest { p ->
                 val src = previewSource ?: return@collectLatest
                 val r = withContext(Dispatchers.Default) {
-                    val key = listOf(p.rotation, p.flipH, p.flipV, p.straighten, p.aspect, src)
+                    val key = listOf(p.rotation, p.flipH, p.flipV, p.straighten, src)
                     val geo = if (key == geoKey && geoBitmap != null) geoBitmap!! else {
                         ImageProcessor.applyGeometry(src, p).also { geoBitmap = it; geoKey = key }
                     }
-                    Rendered(ImageProcessor.applyColor(geo, p), geo)
+                    val cropped = ImageProcessor.applyCrop(geo, p.crop)
+                    val edited = ImageProcessor.finish(cropped, p)
+                    Rendered(edited, cropped, geo, ImageProcessor.histogram(edited))
                 }
                 _rendered.value = r
             }
@@ -96,6 +110,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
                 thumbSource = thumb
                 _opened.value = true
                 undoStack.clear(); _canUndo.value = false
+                _saved.value = null
                 geoKey = null
                 _params.value = EditParams()
                 _rendered.value = null
@@ -117,6 +132,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         geoBitmap = null; geoKey = null
         _rendered.value = null
         _thumbs.value = emptyMap()
+        _saved.value = null
         undoStack.clear(); _canUndo.value = false
         _params.value = EditParams()
     }
@@ -173,6 +189,52 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
     fun resetAll() {
         pushUndo()
         _params.value = EditParams()
+    }
+
+    // ---------- corte e geometria ----------
+
+    /** [dir] = +1 horário, -1 anti-horário (como o usuário vê). O corte acompanha a rotação. */
+    fun rotate(dir: Int) {
+        pushUndo()
+        update { p ->
+            // com um (e só um) espelhamento ativo o sentido da rotação se inverte na imagem final
+            val step = if (p.flipH != p.flipV) -dir else dir
+            p.copy(
+                rotation = ((p.rotation + step) % 4 + 4) % 4,
+                crop = if (dir > 0) CropMath.rotateCw(p.crop) else CropMath.rotateCcw(p.crop)
+            )
+        }
+    }
+
+    fun flip(horizontal: Boolean) {
+        pushUndo()
+        update { p ->
+            if (horizontal) p.copy(flipH = !p.flipH, crop = CropMath.flipH(p.crop))
+            else p.copy(flipV = !p.flipV, crop = CropMath.flipV(p.crop))
+        }
+    }
+
+    /** [imgAspect] = largura/altura da foto girada inteira (a mesma que aparece na tela de corte). */
+    fun setAspect(a: Aspect, imgAspect: Float) {
+        pushUndo()
+        update { p ->
+            val ratio = a.lockFor(imgAspect, p.aspectSwap)
+            p.copy(aspect = a, crop = if (ratio == null) p.crop else CropMath.fit(p.crop, ratio, imgAspect))
+        }
+    }
+
+    fun swapAspect(imgAspect: Float) {
+        pushUndo()
+        update { p ->
+            val swap = !p.aspectSwap
+            val ratio = p.aspect.lockFor(imgAspect, swap)
+            p.copy(aspectSwap = swap, crop = if (ratio == null) p.crop else CropMath.fit(p.crop, ratio, imgAspect))
+        }
+    }
+
+    fun resetCrop() {
+        pushUndo()
+        update { it.copy(crop = FULL_CROP, aspect = Aspect.FREE, aspectSwap = false) }
     }
 
     fun applyPreset(p: Preset) {
@@ -235,7 +297,8 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             _loading.value = true
             val ok = withContext(Dispatchers.IO) {
                 try {
-                    saveJpeg(renderFullRes(src, p), src)
+                    val saved = saveJpeg(renderFullRes(src, p), src)
+                    _saved.value = Saved(saved, p)
                     true
                 } catch (e: CancellationException) {
                     throw e
@@ -259,7 +322,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
         throw failure ?: IllegalStateException("render falhou")
     }
 
-    private fun saveJpeg(bmp: Bitmap, source: Uri) {
+    private fun saveJpeg(bmp: Bitmap, source: Uri): Uri {
         val resolver = getApplication<Application>().contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, "EditorFoto_${System.currentTimeMillis()}.jpg")
@@ -274,6 +337,7 @@ class EditorViewModel(app: Application) : AndroidViewModel(app) {
             values.clear()
             values.put(MediaStore.Images.Media.IS_PENDING, 0)
             resolver.update(uri, values, null, null)
+            return uri
         } catch (e: Throwable) {
             resolver.delete(uri, null, null)   // não deixa arquivo pela metade na galeria
             throw e

@@ -11,8 +11,11 @@ Editor de fotos para Android, **inspirado no Adobe Lightroom**. Sem login, sem a
 - **HSL:** tom, saturação e luminância em 8 cores
 - **Curva de tons:** 5 pontos arrastáveis
 - **Presets:** 10 prontos, e você pode salvar os seus
-- **Cortar:** proporções prontas, girar 90°, espelhar e endireitar
-- **Comparar:** segure a foto para ver o original
+- **Efeitos:** nitidez, vinheta e granulação
+- **Cortar:** corte manual arrastando cantos e bordas (livre ou 1:1, 4:5, 3:2, 16:9, original), girar 90°, espelhar e endireitar
+- **Histograma** ao vivo (botão HIST na prévia) e **zoom** com pinça (toque duplo volta ao normal)
+- **Comparar:** segure a foto, sem mexer, para ver o original
+- **Compartilhar** a foto salva (botão COMPARTILHAR na prévia) e **abrir fotos de outros apps** ("Abrir com", "Editar" e o menu Compartilhar)
 - **Desfazer** e **Resetar**
 - **Salvar** em JPEG (qualidade 95) em `Imagens/EditorFoto`, na **resolução original** da foto e mantendo data, câmera e exposição (EXIF)
 - **P&B de verdade:** saturação em -100 usa a luma, então as cores viram tons de cinza distintos
